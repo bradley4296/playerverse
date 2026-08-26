@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>The Playerverse</title>
+<link rel="icon" href="https://res.cloudinary.com/dtuccytyv/image/upload/v1779735220/Favicon_os9g73.ico" type="image/x-icon">
+
+<!--
+  EVERVERSE LAUNCHER — architecture notes
+  =========================================
+  This file is the ONLY thing you ever host/distribute. It does not contain
+  the Playerverse app itself — it signs the user in, then pulls the current
+  app build (a full HTML document, as a string) out of Firestore and runs it
+  inside a same-origin <iframe srcdoc>. Because the iframe is same-origin
+  (non-sandboxed srcdoc inherits the parent's origin), it shares this page's
+  localStorage/IndexedDB, so the Firebase Auth session you start here carries
+  straight into the app — no token handoff needed.
+
+  Firestore layout this expects:
+    system/playerverseApp                                          { version, html, updatedAt, updatedBy, updatedByEmail, changelog }
+    playerverseVersions/{n}                                        same shape, one doc per published version (history + rollback)
+    artifacts/playerverse_v2_stable/users/{uid}/profile/user_data  existing profile doc — publish access comes from its `appRole` field
+
+  Permission field: profile doc field `appRole`, one of:
+    'member'   (default — everyone starts here, no publish access)
+    'creator'  (can publish new versions and roll back)
+    'admin'    (same as creator, plus can change other users' appRole)
+
+  ONE-TIME SETUP:
+    1. Sign into the launcher once as your main account so its profile doc exists.
+    2. In the Firebase console, open that profile doc at
+       artifacts/playerverse_v2_stable/users/{your-uid}/profile/user_data
+       and set the field appRole to "admin".
+    3. Reload the launcher — the publish panel (bottom right) will offer to
+       bootstrap the first version since none exists yet.
+    4. Merge the rules from firestore-rules-addition.rules into your project's
+       firestore.rules (see that file for the full block + comments).
+-->
+
+<style id="custom-theme-styles"></style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+
+<style>
+  * { font-family: 'Outfit', sans-serif; }
+  body { margin: 0; background: #f8fafc; overflow: hidden; }
+  .hidden { display: none !important; }
+  #pv-frame { display: block; width: 100%; height: 100%; border: 0; background: #f8fafc; }
+  .pv-fadein { animation: pvFadeIn .4s ease both; }
+  @keyframes pvFadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  #loading-overlay { position: fixed; inset: 0; z-index: 10000; background: #ffffff; display: flex; align-items: center; justify-content: center; transition: opacity .5s ease; }
+</style>
+</head>
+<body>
+
+<!-- Splash / loading -->
+<div id="loading-overlay">
+  <div class="text-3xl font-black text-blue-600 tracking-tighter animate-pulse">PLAYERVERSE</div>
+</div>
+
+<!-- Auth screen -->
+<div id="auth-screen" class="hidden fixed inset-0 flex items-center justify-center px-4">
+  <div class="w-full max-w-sm pv-fadein">
+    <div class="text-center mb-8">
+      <div class="text-2xl font-black text-slate-900 tracking-tighter">PLAYERVERSE</div>
+      <p class="text-slate-400 text-sm font-medium mt-1">Eververse Launcher</p>
+    </div>
+
+    <div id="bootstrap-note" class="hidden mb-4 p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 text-xs font-medium">
+      No app build has been published yet. Sign in as a creator and use the panel that opens to publish the first version.
+    </div>
+
+    <form id="auth-form" class="bg-white rounded-3xl border border-slate-100 shadow-sm p-6 space-y-3">
+      <div id="signup-only" class="hidden">
+        <input id="auth-username" type="text" placeholder="Username" autocomplete="off"
+          class="w-full px-4 py-3 rounded-xl border border-slate-200 focus:border-blue-500 focus:outline-none text-sm font-medium">
+      </div>
+      <input id="auth-email" type="email" placeholder="Email" required autocomplete="email"
+        class="w-full px-4 py-3 rounded-xl border border-slate-200 focus:border-blue-500 focus:outline-none text-sm font-medium">
+      <input id="auth-password" type="password" placeholder="Password" required autocomplete="current-password"
+        class="w-full px-4 py-3 rounded-xl border border-slate-200 focus:border-blue-500 focus:outline-none text-sm font-medium">
+
+      <p id="auth-error" class="hidden text-xs font-bold text-red-500 px-1"></p>
+
+      <button type="submit" id="auth-submit-btn"
+        class="w-full bg-blue-600 hover:bg-blue-500 transition-colors text-white font-bold text-sm py-3 rounded-xl">
+        Sign In
+      </button>
+
+      <button type="button" id="auth-toggle-btn" class="w-full text-center text-xs font-bold text-slate-400 hover:text-slate-600 py-1">
+        Need an account? Sign up
+      </button>
+
+      <div class="flex items-center gap-3 py-1">
+        <div class="h-px bg-slate-100 flex-1"></div>
+        <span class="text-[10px] font-black uppercase tracking-widest text-slate-300">or</span>
+        <div class="h-px bg-slate-100 flex-1"></div>
+      </div>
+
+      <button type="button" id="guest-btn"
+        class="w-full bg-slate-100 hover:bg-slate-200 transition-colors text-slate-700 font-bold text-sm py-3 rounded-xl">
+        Continue as Guest
+      </button>
+    </form>
+  </div>
+</div>
+
+<!-- Fatal error state -->
+<div id="fatal-error" class="hidden fixed inset-0 flex items-center justify-center px-4">
+  <div class="max-w-sm text-center pv-fadein">
+    <p class="text-slate-900 font-bold mb-2">Couldn't load Playerverse</p>
+    <p id="fatal-error-text" class="text-slate-400 text-sm mb-4">Something went wrong.</p>
+    <button onclick="window.location.reload()" class="bg-blue-600 hover:bg-blue-500 transition-colors text-white font-bold text-sm px-5 py-2.5 rounded-xl">Retry</button>
+  </div>
+</div>
+
+<!-- The running app -->
+<div id="app-frame-container" class="hidden fixed inset-0">
+  <iframe id="pv-frame" title="Playerverse"></iframe>
+
+  <!-- Live update banner -->
+  <div id="update-banner" class="hidden fixed bottom-6 left-1/2 -translate-x-1/2 z-[9999] bg-slate-900 text-white rounded-2xl shadow-2xl px-5 py-4 flex items-center gap-4 pv-fadein">
+    <span id="update-banner-text" class="text-sm font-medium">A new version is available.</span>
+    <button id="update-reload-btn" class="bg-blue-600 hover:bg-blue-500 transition-colors text-white text-sm font-bold px-4 py-2 rounded-xl">Reload</button>
+    <button id="update-dismiss-btn" class="text-slate-400 hover:text-white text-sm">Later</button>
+  </div>
+
+  <!-- Admin FAB -->
+  <button id="admin-fab" class="hidden fixed bottom-6 right-6 z-[9998] bg-slate-900 hover:bg-slate-800 transition-colors text-white w-12 h-12 rounded-full shadow-2xl flex items-center justify-center">
+    <i data-lucide="shield" class="w-5 h-5"></i>
+  </button>
+
+  <!-- Admin panel -->
+  <div id="admin-panel" class="hidden fixed inset-y-0 right-0 z-[9999] w-full max-w-md bg-white border-l border-slate-100 shadow-2xl overflow-y-auto">
+    <div class="p-6 space-y-6">
+      <div class="flex items-center justify-between">
+        <h2 id="admin-panel-title" class="text-lg font-black text-slate-900 tracking-tight">Admin</h2>
+        <button id="admin-close-btn" class="text-slate-400 hover:text-slate-700"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="flex gap-2 p-1 bg-slate-100 rounded-xl">
+        <button id="tab-publish-btn" class="flex-1 text-xs font-bold py-2 rounded-lg transition-colors">Publish</button>
+        <button id="tab-users-btn" class="hidden flex-1 text-xs font-bold py-2 rounded-lg transition-colors">Manage Users</button>
+      </div>
+
+      <!-- Publish tab -->
+      <div id="tab-publish">
+        <p class="text-xs text-slate-400 font-medium mb-4">Publishing pushes the new build to every signed-in user. They'll see a "reload" prompt — nothing changes for them until they click it.</p>
+
+        <form id="publish-form" class="space-y-3">
+          <div>
+            <label class="text-xs font-black uppercase tracking-wider text-slate-400">Updated HTML file</label>
+            <input id="publish-file" type="file" accept=".html,text/html" class="w-full text-xs mt-1">
+          </div>
+          <p class="text-center text-[10px] font-black uppercase tracking-widest text-slate-300">or paste below</p>
+          <textarea id="publish-textarea" rows="6" placeholder="Paste the full updated playerverse-app.html contents here"
+            class="w-full px-3 py-2 rounded-xl border border-slate-200 focus:border-blue-500 focus:outline-none text-xs font-mono"></textarea>
+          <textarea id="publish-changelog" rows="2" placeholder="What changed? (optional, shown in version history)"
+            class="w-full px-3 py-2 rounded-xl border border-slate-200 focus:border-blue-500 focus:outline-none text-xs font-medium"></textarea>
+          <button type="submit" class="w-full bg-slate-900 hover:bg-slate-800 transition-colors text-white font-bold text-sm py-3 rounded-xl">Publish New Version</button>
+          <p id="publish-status" class="text-xs font-bold text-center text-slate-400"></p>
+        </form>
+
+        <div class="mt-6">
+          <h3 class="text-xs font-black uppercase tracking-wider text-slate-400 mb-3">Version History</h3>
+          <div id="version-history"></div>
+        </div>
+      </div>
+
+      <!-- Manage Users tab -->
+      <div id="tab-users" class="hidden">
+        <p id="users-description" class="text-xs text-slate-400 font-medium mb-4">Anyone without a role set shows as a Normal User by default. Only creators can change roles; admins can view the player list.</p>
+        <p id="users-status" class="text-xs font-bold text-slate-400 mb-3"></p>
+        <div id="user-list" class="space-y-1"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Confirmation modal (ban/unban/delete) -->
+<div id="pv-confirm-overlay" class="hidden fixed inset-0 z-[10050] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm px-4">
+  <div id="pv-confirm-card" class="w-full max-w-sm bg-white rounded-3xl border border-slate-100 shadow-2xl p-6 pv-fadein"></div>
+</div>
+
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-app.js";
+import {
+  getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword,
+  signInAnonymously, onAuthStateChanged, updateProfile
+} from "https://www.gstatic.com/firebasejs/11.0.2/firebase-auth.js";
+import {
+  getFirestore, doc, getDoc, updateDoc, deleteField, onSnapshot, collection, collectionGroup,
+  query, orderBy, limit, getDocs, serverTimestamp, writeBatch
+} from "https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js";
+
+// Same project as the app itself — this is what makes the shared auth session work.
+const firebaseConfig = {
+  apiKey: "AIzaSyD01Aif3w0jdcELY-zCglMN4FkePmBLFNg",
+  authDomain: "the-playerverse.firebaseapp.com",
+  projectId: "the-playerverse",
+  storageBucket: "the-playerverse.firebasestorage.app",
+  messagingSenderId: "1083471047782",
+  appId: "1:1083471047782:web:b64b08b62c57023e3e91a7",
+  measurementId: "G-H2T8EKGGZY"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+const el = (id) => document.getElementById(id);
+lucide.createIcons();
+
+let currentUser = null;
+let appRole = 'member';
+let canPublish = false; // creator only
+let canManageUsers = false; // creator or admin
+let canChangeRoles = false; // creator only
+let canModerateAccounts = false; // creator only — ban/unban/delete
+let loadedVersion = null;
+let versionUnsub = null;
+let isSignUpMode = false;
+
+function hideLoader() {
+  const loader = el('loading-overlay');
+  loader.style.opacity = '0';
+  setTimeout(() => loader.classList.add('hidden'), 500);
+}
+
+function showAuth() {
+  el('auth-screen').classList.remove('hidden');
+  el('app-frame-container').classList.add('hidden');
+  el('fatal-error').classList.add('hidden');
+}
+
+function showApp() {
+  el('auth-screen').classList.add('hidden');
+  el('fatal-error').classList.add('hidden');
+  el('app-frame-container').classList.remove('hidden');
+  lucide.createIcons();
+}
+
+function showFatalError(msg) {
+  el('fatal-error-text').textContent = msg;
+  el('fatal-error').classList.remove('hidden');
+  el('auth-screen').classList.add('hidden');
+  el('app-frame-container').classList.add('hidden');
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// --- Auth form wiring ---
+el('auth-toggle-btn').addEventListener('click', () => {
+  isSignUpMode = !isSignUpMode;
+  el('signup-only').classList.toggle('hidden', !isSignUpMode);
+  el('auth-submit-btn').textContent = isSignUpMode ? 'Create Account' : 'Sign In';
+  el('auth-toggle-btn').textContent = isSignUpMode ? 'Already have an account? Sign in' : 'Need an account? Sign up';
+  el('auth-error').classList.add('hidden');
+});
+
+el('auth-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const email = el('auth-email').value.trim();
+  const password = el('auth-password').value;
+  const username = el('auth-username').value.trim();
+  el('auth-error').classList.add('hidden');
+  el('auth-submit-btn').disabled = true;
+
+  try {
+    if (isSignUpMode) {
+      const cred = await createUserWithEmailAndPassword(auth, email, password);
+      if (username) await updateProfile(cred.user, { displayName: username });
+    } else {
+      await signInWithEmailAndPassword(auth, email, password);
+    }
+  } catch (err) {
+    el('auth-error').textContent = (err.message || 'Something went wrong.').replace('Firebase: ', '');
+    el('auth-error').classList.remove('hidden');
+  } finally {
+    el('auth-submit-btn').disabled = false;
+  }
+});
+
+el('guest-btn').addEventListener('click', async () => {
+  el('auth-error').classList.add('hidden');
+  try {
+    await signInAnonymously(auth);
+  } catch (err) {
+    el('auth-error').textContent = (err.message || 'Could not continue as guest.').replace('Firebase: ', '');
+    el('auth-error').classList.remove('hidden');
+  }
+});
+
+// --- Main auth state flow ---
+onAuthStateChanged(auth, async (user) => {
+  if (user) {
+    currentUser = user;
+    await checkAdmin(user.uid);
+    await loadApp();
+  } else {
+    currentUser = null;
+    appRole = 'member';
+    canPublish = false;
+    canManageUsers = false;
+    canChangeRoles = false;
+    canModerateAccounts = false;
+    if (versionUnsub) { versionUnsub(); versionUnsub = null; }
+    el('pv-frame').srcdoc = 'about:blank';
+    showAuth();
+    hideLoader();
+  }
+});
+
+async function checkAdmin(uid) {
+  try {
+    const snap = await getDoc(doc(db, 'artifacts', 'playerverse_v2_stable', 'users', uid, 'profile', 'user_data'));
+    appRole = snap.exists() ? (snap.data().appRole || 'member') : 'member';
+  } catch (err) {
+    appRole = 'member';
+  }
+  canPublish = appRole === 'creator';
+  canManageUsers = appRole === 'creator' || appRole === 'admin';
+  canChangeRoles = appRole === 'creator';
+  canModerateAccounts = appRole === 'creator';
+  el('admin-fab').classList.toggle('hidden', !canManageUsers);
+  el('tab-publish-btn').classList.toggle('hidden', !canPublish);
+  el('tab-users-btn').classList.toggle('hidden', !canManageUsers);
+  el('admin-panel-title').textContent = appRole === 'creator' ? 'Creator Control' : 'Admin';
+  el('users-description').textContent = canChangeRoles
+    ? 'View every Playerverse account, assign launcher roles, and ban or delete accounts. Only the Creator can do this.'
+    : 'Player list is read-only for admins. Only the Creator can change roles, ban, or delete accounts.';
+  if (appRole === 'admin') el('update-banner').classList.add('hidden');
+}
+
+async function loadApp() {
+  try {
+    const metaSnap = await getDoc(doc(db, 'system', 'playerverseApp'));
+    if (!metaSnap.exists() || !metaSnap.data().html) {
+      hideLoader();
+      showAuth();
+      el('bootstrap-note').classList.remove('hidden');
+      if (canPublish) {
+        el('admin-fab').classList.remove('hidden');
+        showApp(); // reveal frame container (empty) so the admin panel/FAB can be used
+        el('app-frame-container').classList.remove('hidden');
+        el('auth-screen').classList.remove('hidden');
+        openAdminPanel();
+      }
+      return;
+    }
+    const data = metaSnap.data();
+    loadedVersion = data.version || 1;
+    mountFrame(data.html);
+    watchForUpdates();
+    hideLoader();
+    showApp();
+  } catch (err) {
+    console.error(err);
+    hideLoader();
+    showFatalError('Check your connection and try again.');
+  }
+}
+
+function mountFrame(html) {
+  el('pv-frame').srcdoc = html;
+}
+
+function watchForUpdates() {
+  if (versionUnsub) versionUnsub();
+  versionUnsub = onSnapshot(doc(db, 'system', 'playerverseApp'), (snap) => {
+    const v = snap.data()?.version;
+    if (v && v > loadedVersion && appRole !== 'admin') {
+      el('update-banner-text').textContent = `Playerverse v${v} is available.`;
+      el('update-banner').classList.remove('hidden');
+    } else if (appRole === 'admin') {
+      el('update-banner').classList.add('hidden');
+    }
+  });
+}
+
+async function reloadApp() {
+  el('update-banner').classList.add('hidden');
+  try {
+    const metaSnap = await getDoc(doc(db, 'system', 'playerverseApp'));
+    const data = metaSnap.data();
+    loadedVersion = data.version;
+    mountFrame(data.html);
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+el('update-reload-btn').addEventListener('click', reloadApp);
+el('update-dismiss-btn').addEventListener('click', () => el('update-banner').classList.add('hidden'));
+
+// The embedded app can also ask us to reload it (e.g. from its own in-app update toast)
+window.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'playerverse:reload') reloadApp();
+  if (e.data && e.data.type === 'playerverse:auth-required') {
+    // The embedded app never owns authentication; return the user to the launcher login/guest screen.
+    showAuth();
+  }
+});
+
+// --- Admin panel ---
+el('admin-fab').addEventListener('click', openAdminPanel);
+el('admin-close-btn').addEventListener('click', () => el('admin-panel').classList.add('hidden'));
+
+function openAdminPanel() {
+  if (!canManageUsers) return;
+  el('admin-panel').classList.remove('hidden');
+  showAdminTab(canPublish ? 'publish' : 'users');
+}
+
+function showAdminTab(name) {
+  if (name === 'publish' && !canPublish) name = 'users';
+  if (name === 'users' && !canManageUsers) return;
+  const finalIsPublish = name === 'publish';
+  el('tab-publish').classList.toggle('hidden', !finalIsPublish);
+  el('tab-users').classList.toggle('hidden', finalIsPublish);
+  el('tab-publish-btn').classList.toggle('bg-white', finalIsPublish);
+  el('tab-publish-btn').classList.toggle('shadow-sm', finalIsPublish);
+  el('tab-publish-btn').classList.toggle('text-slate-900', finalIsPublish);
+  el('tab-publish-btn').classList.toggle('text-slate-400', !finalIsPublish);
+  el('tab-users-btn').classList.toggle('bg-white', !finalIsPublish);
+  el('tab-users-btn').classList.toggle('shadow-sm', !finalIsPublish);
+  el('tab-users-btn').classList.toggle('text-slate-900', !finalIsPublish);
+  el('tab-users-btn').classList.toggle('text-slate-400', finalIsPublish);
+  if (finalIsPublish) loadVersionHistory();
+  else loadUserList();
+}
+
+el('tab-publish-btn').addEventListener('click', () => { if (canPublish) showAdminTab('publish'); });
+el('tab-users-btn').addEventListener('click', () => { if (canManageUsers) showAdminTab('users'); });
+
+// Roles shown in the creator-controlled player list, mapped to appRole.
+// Labeled to avoid confusion with Playerverse's own in-app "Creator Studio" —
+// this role is about launcher publish access, not game/post creation.
+const PV_ROLE_LABELS = { member: 'Normal User', creator: 'Creator', admin: 'Admin' };
+
+async function loadUserList() {
+  if (!canManageUsers) return;
+  el('users-status').textContent = 'Loading users...';
+  el('user-list').innerHTML = '';
+  try {
+    const snaps = await getDocs(query(collectionGroup(db, 'profile'), limit(500)));
+    const rows = [];
+    const backfillBatch = writeBatch(db);
+    let backfillCount = 0;
+
+    snaps.forEach((s) => {
+      const data = s.data();
+      const uid = s.ref.parent.parent?.id;
+      if (!uid) return;
+      let role = data.appRole;
+      if (!role) {
+        role = 'member'; // shown as Normal User below
+        if (canChangeRoles) {
+          backfillBatch.update(s.ref, { appRole: 'member' });
+          backfillCount++;
+        }
+      }
+      rows.push({
+        uid, ref: s.ref, username: data.username || uid, role,
+        accountStatus: data.accountStatus || 'active'
+      });
+    });
+
+    if (backfillCount > 0) {
+      await backfillBatch.commit();
+    }
+
+    if (rows.length === 0) {
+      el('users-status').textContent = 'No users found.';
+      return;
+    }
+
+    rows.sort((a, b) => a.username.localeCompare(b.username));
+    el('users-status').textContent = backfillCount > 0
+      ? `${rows.length} users (${backfillCount} defaulted to Normal User)`
+      : `${rows.length} users`;
+
+    rows.forEach((row) => {
+      const rowEl = document.createElement('div');
+      const protectedSelf = row.uid === currentUser?.uid;
+      const isBanned = row.accountStatus === 'banned';
+      const isDeleted = row.accountStatus === 'deleted';
+      rowEl.className = 'flex items-center justify-between gap-3 py-3 border-b border-slate-100 last:border-0 flex-wrap';
+      rowEl.innerHTML = `
+        <div class="min-w-0">
+          <p class="font-bold text-slate-900 text-sm truncate flex items-center gap-1.5">
+            ${escapeHtml(row.username)}
+            ${isBanned ? '<span class="text-[9px] font-black uppercase tracking-wider bg-red-50 text-red-500 border border-red-200 px-1.5 py-0.5 rounded-full">Banned</span>' : ''}
+            ${isDeleted ? '<span class="text-[9px] font-black uppercase tracking-wider bg-slate-100 text-slate-400 border border-slate-200 px-1.5 py-0.5 rounded-full">Deleted</span>' : ''}
+          </p>
+          <p class="text-[10px] text-slate-300 truncate">${row.uid}</p>
+        </div>
+        <div class="flex items-center gap-2 shrink-0">
+          ${protectedSelf
+            ? '<span class="text-[10px] font-black text-slate-300 uppercase">You</span>'
+            : ''}
+          ${!protectedSelf && canChangeRoles
+            ? `<select class="role-select shrink-0 text-xs font-bold border border-slate-200 rounded-lg px-2 py-2 bg-white">
+                ${Object.entries(PV_ROLE_LABELS).map(([val, label]) =>
+                  `<option value="${val}" ${val === row.role ? 'selected' : ''}>${label}</option>`).join('')}
+              </select>`
+            : (!protectedSelf ? `<span class="text-xs font-bold px-2 py-2 rounded-lg bg-slate-100 text-slate-500">${escapeHtml(PV_ROLE_LABELS[row.role] || 'Normal User')}</span>` : '')}
+          ${!protectedSelf && canModerateAccounts && !isDeleted
+            ? `<button class="ban-btn text-xs font-bold px-3 py-2 rounded-lg border transition-colors ${isBanned ? 'border-slate-200 text-slate-600 hover:bg-slate-50' : 'border-red-200 text-red-500 hover:bg-red-50'}">${isBanned ? 'Unban' : 'Ban'}</button>`
+            : ''}
+          ${!protectedSelf && canModerateAccounts && !isDeleted
+            ? `<button class="delete-btn text-xs font-bold px-3 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white transition-colors">Delete</button>`
+            : ''}
+        </div>
+      `;
+      const select = rowEl.querySelector('.role-select');
+      if (select) {
+        select.addEventListener('change', async () => {
+          const newRole = select.value;
+          select.disabled = true;
+          try {
+            await updateDoc(row.ref, { appRole: newRole });
+          } catch (err) {
+            console.error(err);
+            alert('Could not update role: ' + err.message);
+            select.value = row.role;
+          } finally {
+            select.disabled = false;
+          }
+        });
+      }
+      const banBtn = rowEl.querySelector('.ban-btn');
+      if (banBtn) {
+        banBtn.addEventListener('click', () => pvStartBanFlow(row, isBanned));
+      }
+      const deleteBtn = rowEl.querySelector('.delete-btn');
+      if (deleteBtn) {
+        deleteBtn.addEventListener('click', () => pvStartDeleteFlow(row));
+      }
+      el('user-list').appendChild(rowEl);
+    });
+  } catch (err) {
+    console.error(err);
+    el('users-status').textContent = 'Could not load users: ' + err.message;
+  }
+}
+
+// ========== CONFIRMATION MODAL ==========
+function pvShowConfirm(html) {
+  el('pv-confirm-card').innerHTML = html;
+  el('pv-confirm-overlay').classList.remove('hidden');
+}
+function pvCloseConfirm() {
+  el('pv-confirm-overlay').classList.add('hidden');
+  el('pv-confirm-card').innerHTML = '';
+}
+
+function pvStartBanFlow(row, isBanned) {
+  const action = isBanned ? 'unban' : 'ban';
+  pvShowConfirm(`
+    <p class="text-lg font-black text-slate-900 mb-2">${isBanned ? 'Unban' : 'Ban'} ${escapeHtml(row.username)}?</p>
+    <p class="text-sm text-slate-400 font-medium mb-5">${isBanned
+      ? 'This restores their access to Playerverse.'
+      : 'They will be signed out of Playerverse and unable to sign back in until unbanned.'}</p>
+    <div class="flex gap-2">
+      <button id="pv-confirm-cancel" class="flex-1 bg-slate-100 hover:bg-slate-200 transition-colors text-slate-700 font-bold text-sm py-3 rounded-xl">Cancel</button>
+      <button id="pv-confirm-ok" class="flex-1 ${isBanned ? 'bg-slate-900 hover:bg-slate-800' : 'bg-red-600 hover:bg-red-500'} transition-colors text-white font-bold text-sm py-3 rounded-xl">${isBanned ? 'Unban' : 'Ban'}</button>
+    </div>
+  `);
+  el('pv-confirm-cancel').onclick = pvCloseConfirm;
+  el('pv-confirm-ok').onclick = async () => {
+    el('pv-confirm-ok').disabled = true;
+    el('pv-confirm-ok').textContent = 'Working...';
+    try {
+      await updateDoc(row.ref, {
+        accountStatus: isBanned ? 'active' : 'banned',
+        bannedAt: isBanned ? deleteField() : serverTimestamp(),
+        bannedBy: isBanned ? deleteField() : currentUser.uid,
+        banReason: isBanned ? deleteField() : 'Playerverse launcher moderation'
+      });
+      pvCloseConfirm();
+      loadUserList();
+    } catch (err) {
+      console.error(err);
+      alert(`Could not ${action} user: ` + err.message);
+      pvCloseConfirm();
+    }
+  };
+}
+
+// Deleting an account is permanent-feeling enough that it gets three
+// increasingly dramatic confirmations, then a small math check so a
+// stray double-click can never be the thing that deletes someone.
+const PV_DELETE_STAGES = [
+  {
+    title: (name) => `Delete ${name}?`,
+    body: () => 'This disables their account and marks the profile as deleted.',
+    confirmLabel: 'Delete'
+  },
+  {
+    title: () => 'Are you sure? Really sure?',
+    body: (name) => `${name} will lose access immediately. This isn't something you casually undo.`,
+    confirmLabel: 'Yes, continue'
+  },
+  {
+    title: () => 'Last chance to back out.',
+    body: (name) => `Once you confirm, ${name}'s account is marked deleted for good. No backsies.`,
+    confirmLabel: "I'm sure, continue"
+  }
+];
+
+function pvStartDeleteFlow(row) {
+  pvRenderDeleteStage(row, 0);
+}
+
+function pvRenderDeleteStage(row, stageIndex) {
+  const stage = PV_DELETE_STAGES[stageIndex];
+  const name = escapeHtml(row.username);
+  pvShowConfirm(`
+    <p class="text-lg font-black text-slate-900 mb-2">${stage.title(name)}</p>
+    <p class="text-sm text-slate-400 font-medium mb-5">${stage.body(name)}</p>
+    <div class="flex gap-2">
+      <button id="pv-confirm-cancel" class="flex-1 bg-slate-100 hover:bg-slate-200 transition-colors text-slate-700 font-bold text-sm py-3 rounded-xl">Cancel</button>
+      <button id="pv-confirm-ok" class="flex-1 bg-red-600 hover:bg-red-500 transition-colors text-white font-bold text-sm py-3 rounded-xl">${stage.confirmLabel}</button>
+    </div>
+  `);
+  el('pv-confirm-cancel').onclick = pvCloseConfirm;
+  el('pv-confirm-ok').onclick = () => {
+    if (stageIndex + 1 < PV_DELETE_STAGES.length) {
+      pvRenderDeleteStage(row, stageIndex + 1);
+    } else {
+      pvRenderDeleteMathStage(row);
+    }
+  };
+}
+
+function pvRenderDeleteMathStage(row) {
+  const a = 2 + Math.floor(Math.random() * 8);
+  const b = 2 + Math.floor(Math.random() * 8);
+  const answer = a + b;
+  const name = escapeHtml(row.username);
+  pvShowConfirm(`
+    <p class="text-lg font-black text-slate-900 mb-2">Prove it.</p>
+    <p class="text-sm text-slate-400 font-medium mb-4">Solve this to permanently confirm deleting ${name}:</p>
+    <p class="text-2xl font-black text-slate-900 mb-3 text-center">${a} + ${b} = ?</p>
+    <input id="pv-delete-answer" type="number" inputmode="numeric" autocomplete="off"
+      class="w-full px-4 py-3 rounded-xl border border-slate-200 focus:border-red-500 focus:outline-none text-sm font-bold text-center mb-2">
+    <p id="pv-delete-answer-error" class="hidden text-xs font-bold text-red-500 text-center mb-2">That's not it. Try again.</p>
+    <div class="flex gap-2 mt-3">
+      <button id="pv-confirm-cancel" class="flex-1 bg-slate-100 hover:bg-slate-200 transition-colors text-slate-700 font-bold text-sm py-3 rounded-xl">Cancel</button>
+      <button id="pv-confirm-ok" class="flex-1 bg-red-600 hover:bg-red-500 transition-colors text-white font-bold text-sm py-3 rounded-xl">Confirm Delete</button>
+    </div>
+  `);
+  el('pv-confirm-cancel').onclick = pvCloseConfirm;
+  const input = el('pv-delete-answer');
+  input.focus();
+  el('pv-confirm-ok').onclick = async () => {
+    if (parseInt(input.value, 10) !== answer) {
+      el('pv-delete-answer-error').classList.remove('hidden');
+      input.focus();
+      return;
+    }
+    el('pv-confirm-ok').disabled = true;
+    el('pv-confirm-ok').textContent = 'Deleting...';
+    try {
+      await updateDoc(row.ref, {
+        accountStatus: 'deleted',
+        deletedAt: serverTimestamp(),
+        deletedBy: currentUser.uid,
+        deletedReason: 'Playerverse launcher moderation'
+      });
+      pvCloseConfirm();
+      loadUserList();
+    } catch (err) {
+      console.error(err);
+      alert('Account deletion failed: ' + err.message);
+      pvCloseConfirm();
+    }
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') el('pv-confirm-ok').click();
+  });
+}
+
+el('publish-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!canPublish) {
+    el('publish-status').textContent = 'Creator access required.';
+    return;
+  }
+  const fileInput = el('publish-file');
+  const textArea = el('publish-textarea');
+  let code = '';
+  if (fileInput.files[0]) code = await fileInput.files[0].text();
+  else code = textArea.value;
+
+  if (!code.trim()) {
+    el('publish-status').textContent = 'Select a file or paste the HTML first.';
+    return;
+  }
+
+  try {
+    const metaSnap = await getDoc(doc(db, 'system', 'playerverseApp'));
+    const currentVersion = metaSnap.exists() ? (metaSnap.data().version || 0) : 0;
+    const newVersion = currentVersion + 1;
+
+    if (/\/\*PV_VERSION\*\/\s*\d+/.test(code)) {
+      code = code.replace(/\/\*PV_VERSION\*\/\s*\d+/, `/*PV_VERSION*/ ${newVersion}`);
+    }
+
+    const changelog = el('publish-changelog').value.trim();
+    if (!confirm(`Publish version ${newVersion}? Every signed-in user will be offered this update.`)) return;
+
+    el('publish-status').textContent = 'Publishing...';
+    const batch = writeBatch(db);
+    const payload = {
+      version: newVersion,
+      html: code,
+      updatedAt: serverTimestamp(),
+      updatedBy: currentUser.uid,
+      updatedByEmail: currentUser.email || 'guest',
+      changelog: changelog || ''
+    };
+    batch.set(doc(db, 'system', 'playerverseApp'), payload);
+    batch.set(doc(db, 'playerverseVersions', String(newVersion)), payload);
+    await batch.commit();
+
+    el('publish-status').textContent = `Published v${newVersion}.`;
+    el('publish-textarea').value = '';
+    fileInput.value = '';
+    el('publish-changelog').value = '';
+    el('bootstrap-note').classList.add('hidden');
+    loadedVersion = newVersion;
+    mountFrame(code);
+    loadVersionHistory();
+  } catch (err) {
+    console.error(err);
+    el('publish-status').textContent = 'Publish failed: ' + err.message;
+  }
+});
+
+async function loadVersionHistory() {
+  if (!canPublish) return;
+  el('version-history').innerHTML = '<p class="text-sm text-slate-400">Loading...</p>';
+  try {
+    const q = query(collection(db, 'playerverseVersions'), orderBy('version', 'desc'), limit(10));
+    const snaps = await getDocs(q);
+    if (snaps.empty) {
+      el('version-history').innerHTML = '<p class="text-sm text-slate-400">No published versions yet.</p>';
+      return;
+    }
+    el('version-history').innerHTML = '';
+    snaps.forEach((s) => {
+      const d = s.data();
+      const row = document.createElement('div');
+      row.className = 'flex items-center justify-between gap-3 py-3 border-b border-slate-100 last:border-0';
+      row.innerHTML = `
+        <div class="min-w-0">
+          <p class="font-bold text-slate-900 text-sm">v${d.version}${d.version === loadedVersion ? ' <span class="text-blue-600">(live)</span>' : ''}</p>
+          <p class="text-xs text-slate-400 truncate">${d.changelog ? escapeHtml(d.changelog) : 'No changelog'}</p>
+        </div>
+        <button data-v="${d.version}" class="rollback-btn shrink-0 text-xs font-bold px-3 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700">Rollback</button>
+      `;
+      el('version-history').appendChild(row);
+    });
+    document.querySelectorAll('.rollback-btn').forEach((btn) => {
+      btn.addEventListener('click', () => rollbackTo(parseInt(btn.dataset.v, 10)));
+    });
+  } catch (err) {
+    console.error(err);
+    el('version-history').innerHTML = '<p class="text-sm text-red-500">Could not load history.</p>';
+  }
+}
+
+async function rollbackTo(oldVersion) {
+  if (!canPublish) { alert('Creator access required.'); return; }
+  if (!confirm(`Roll back to v${oldVersion}? This republishes its code as a new version.`)) return;
+  try {
+    const oldSnap = await getDoc(doc(db, 'playerverseVersions', String(oldVersion)));
+    if (!oldSnap.exists()) {
+      alert('That version was not found.');
+      return;
+    }
+    const oldData = oldSnap.data();
+    const metaSnap = await getDoc(doc(db, 'system', 'playerverseApp'));
+    const currentVersion = metaSnap.exists() ? (metaSnap.data().version || 0) : 0;
+    const newVersion = currentVersion + 1;
+    let code = oldData.html;
+    if (/\/\*PV_VERSION\*\/\s*\d+/.test(code)) {
+      code = code.replace(/\/\*PV_VERSION\*\/\s*\d+/, `/*PV_VERSION*/ ${newVersion}`);
+    }
+    const batch = writeBatch(db);
+    const payload = {
+      version: newVersion,
+      html: code,
+      updatedAt: serverTimestamp(),
+      updatedBy: currentUser.uid,
+      updatedByEmail: currentUser.email || 'guest',
+      changelog: `Rollback to v${oldVersion}`
+    };
+    batch.set(doc(db, 'system', 'playerverseApp'), payload);
+    batch.set(doc(db, 'playerverseVersions', String(newVersion)), payload);
+    await batch.commit();
+    loadedVersion = newVersion;
+    mountFrame(code);
+    loadVersionHistory();
+  } catch (err) {
+    console.error(err);
+    alert('Rollback failed: ' + err.message);
+  }
+}
+</script>
+</body>
+</html>
